@@ -9,6 +9,8 @@ import tensorflow
 from tqdm import tqdm_notebook
 import tensorflow_hub as hub
 
+import itertools
+import networkx as nxå
 
 def get_html_soup(url):
     """Uses Beautiful Soup to extract html from a url. Returns a soup object """
@@ -62,7 +64,7 @@ class MultiThreading:
 
 class SpacyTransformer:
 
-    def __init__(self):
+    def __init__(self, df, source_col, model):
         self.df = df
         self.source_col = source_col
         self.model = model
@@ -146,6 +148,124 @@ class UniversalSentenceEncoder:
 
     def get_encoding(self, sentence):
         return np.array(self.USE([sentence])[0])
+
+class NetworkGeneration:
+
+    def __init__(self, df):
+        self.df = df
+        self.edge_df = None
+        self.node_df = None
+        self.node_dic = None
+        self.edge_df = None
+        self.G = None
+        self.graph_adjacencies = None
+        self.graph_betweeness = None
+        self.graph_clustering_coeff = None
+        self.graph_communities = None
+        self.graph_communities_dict = None
+
+    def _get_batches(self, df):
+        batch = [df.iloc[i] for i in range(len(df.index))]
+        return batch
+
+    def _rank_topics(self, batches):
+        batches.sort()
+        return batches
+
+    def _get_unique_combinations(self, batches):
+        return list(itertools.combinations(self._rank_topics(batches), 2))
+
+    def _add_unique_combinations(self, unique_combinations, edge_dict):
+
+        for combination in unique_combinations:
+            if combination in edge_dict:
+                edge_dict[combination] += 1
+            else:
+                edge_dict[combination] = 1
+        return edge_dict
+        # calculates the edges and nodes that exist in the list of hashtag lists
+
+    def _get_edge_df(self, batches):
+
+        self.batches = self._get_batches(self.df)
+        edge_dict = {}
+        source = []
+        target = []
+        edge_frequency = []
+
+        # execute functions as above looping through each list, finding all unique combinations in each list
+        # and adding them to dict object
+        for batch in batches:
+            edge_dict = self._add_unique_combinations(self._get_unique_combinations(batch), edge_dict)
+
+        # create edge dataframe
+        for key, value in edge_dict.items():
+            source.append(key[0])
+            target.append(key[1])
+            edge_frequency.append(value)
+
+        edge_df = pd.DataFrame({'source': source, 'target': target, 'edge_frequency': edge_frequency})
+        edge_df.sort_values(by='edge_frequency', ascending=False, inplace=True)
+        edge_df.reset_index(drop=True, inplace=True)
+        return edge_df
+
+    def _get_node_df(self, edge_df):
+        node_df = pd.DataFrame({'id': list(set(list(edge_df['source']) + list(edge_df['target'])))})
+        node_df['id_code'] = node_df.index
+        return node_df
+
+    def _get_node_dic(self, node_df):
+        dic_values = [i for i in range(len(node_df['id']))]
+        # print(node_df['id'])
+        return dict(zip(node_df['id'], dic_values))
+
+    def _updated_edge_df(self, edge_df, node_dict):
+        edge_df['source_code'] = edge_df['source'].apply(lambda x: node_dict[x])
+        edge_df['target_code'] = edge_df['target'].apply(lambda x: node_dict[x])
+        return edge_df
+
+    def _extract_edges(self, edge_df):
+        tuple_out = []
+        for i in range(0, len(edge_df.index)):
+            tuple_out.append((edge_df['source_code'][i], edge_df['target_code'][i]))
+        return tuple_out
+
+    def _build_graph(self, edge_df, node_df):
+        G = nx.Graph()
+        G.add_nodes_from(node_df.id_code)
+        edge_tuples = self._extract_edges(edge_df)
+        for i in edge_tuples:
+            G.add_edge(i[0], i[1])
+        return G
+
+    def _community_allocation(self, source_val):
+        for k, v in self.graph_communities_dict.items():
+            if source_val in v:
+                return k
+
+    def fit_transform(self):
+        print('Getting edges and nodes..')
+        self.edge_df = self._get_edge_df(self.df)
+        self.node_df = self._get_node_df(self.edge_df)
+        self.node_dic = self._get_node_dic(self.node_df)
+        self.edge_df = self._updated_edge_df(self.edge_df, self.node_dic)
+        print('Building graph..')
+
+        self.G = self._build_graph(self.edge_df, self.node_df)
+        self.graph_adjacencies = dict(self.G.adjacency())
+        self.graph_betweeness = nx.betweenness_centrality(self.G)
+        self.graph_clustering_coeff = nx.clustering(self.G)
+        self.graph_communities = nx.community.greedy_modularity_communities(self.G)
+
+        self.node_df['adjacency_frequency'] = self.node_df['id_code'].map(lambda x: len(self.graph_adjacencies[x]))
+        self.node_df['betweeness_centrality'] = self.node_df['id_code'].map(lambda x: self.graph_betweeness[x])
+        self.node_df['clustering_coefficient'] = self.node_df['id_code'].map(lambda x: self.graph_clustering_coeff[x])
+        self.graph_communities_dict = {}
+        nodes_in_community = [list(i) for i in self.graph_communities]
+
+        for i in nodes_in_community:
+            self.graph_communities_dict[nodes_in_community.index(i)] = i
+        self.node_df['community'] = self.node_df['id_code'].map(lambda x: self._community_allocation(x))
 
 
 
