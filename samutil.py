@@ -10,7 +10,7 @@ from tqdm import tqdm_notebook
 import tensorflow_hub as hub
 
 import itertools
-import networkx as nxå
+import networkx as nx
 
 def get_html_soup(url):
     """Uses Beautiful Soup to extract html from a url. Returns a soup object """
