@@ -5,12 +5,21 @@ import numpy as np
 import pandas as pd
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 from sklearn.feature_extraction.text import CountVectorizer
-import tensorflow
+
 from tqdm import tqdm_notebook
 import tensorflow_hub as hub
+import tensorflow as tf
+from transformers import BertTokenizer, BertModel
+import torch
+from tqdm.notebook import tqdm
+from sklearn.manifold import TSNE
+
+import clip
+from PIL import Image
 
 import itertools
 import networkx as nx
+
 
 def get_html_soup(url):
     """Uses Beautiful Soup to extract html from a url. Returns a soup object """
@@ -141,21 +150,120 @@ def most_common_tokens(data, additional_stopwords=None, token=2):
     return word_counts
 
 
-class UniversalSentenceEncoder:
+class UniversalSentenceTransformer:
 
     def __init__(self):
-        self.USE = hub.load("https://tfhub.dev/google/universal-sentence-encoder/4")
+        self.USE = hub.load("https://tfhub.dev/google/universal-sentence-encoder/3")
 
-    def get_encoding(self, sentence):
-        return np.array(self.USE([sentence])[0])
+    def _get_encoding(self, sentence):
+        return self.USE([sentence])['outputs'].numpy()
 
-class NetworkGeneration:
+    def fit_transform(self, text_inputs=[]):
+        results = []
+        for text in tqdm(text_inputs):
+            results.append((text, self._get_encoding(text)[0]))
+        results = pd.DataFrame(results, columns=['text', 'vector'])
+        vector_results = pd.DataFrame(results['vector'].apply(pd.Series))
+        self.results = pd.concat([results['text'], vector_results], axis=1).set_index('text')
+        self.results.columns = ['USE_' + str(i) for i in self.results.columns]
+        return self.results
+
+
+class BertTransformer():
+
+    def __init__(self):
+        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        self.model = BertModel.from_pretrained('bert-base-uncased', output_hidden_states=True, )
+        self.model.eval()
+
+    def _get_tokens(self, text_input):
+        marked_text = "[CLS] " + text_input + " [SEP]"
+        tokenized_text = self.tokenizer.tokenize(marked_text)
+        indexed_tokens = self.tokenizer.convert_tokens_to_ids(tokenized_text)
+        segments_ids = [1] * len(tokenized_text)
+        return indexed_tokens, segments_ids
+
+    def _get_tensors(self, indexed_tokens, segments_ids):
+        tokens_tensor = torch.tensor([indexed_tokens])
+        segments_tensors = torch.tensor([segments_ids])
+        return tokens_tensor, segments_tensors
+
+    def _get_hidden_states(self, tokens_tensor, segments_tensors):
+        with torch.no_grad():
+            outputs = self.model(tokens_tensor, segments_tensors)
+            hidden_states = outputs[2]
+        token_vecs = hidden_states[-2][0]
+        sentence_embedding = torch.mean(token_vecs, dim=0)
+        return sentence_embedding
+
+    def fit_transform(self, text_inputs=[], reduce=True):
+        results = []
+        for text in tqdm(text_inputs):
+            indexed_tokens, segments_ids = self._get_tokens(text)
+            tokens_tensor, segments_tensors = self._get_tensors(indexed_tokens, segments_ids)
+            embedding = self._get_hidden_states(tokens_tensor, segments_tensors)
+            results.append((text, np.array(embedding)))
+        results = pd.DataFrame(results, columns=['text', 'vector'])
+        vector_results = results['vector'].apply(pd.Series)
+        self.results = pd.concat([results['text'], vector_results], axis=1).set_index('text')
+        self.results.columns = ['BERT_' + str(i) for i in self.results.columns]
+        return self.results
+
+
+class ClipTransformer():
+
+    def __init__(self):
+        self.torch_device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model, self.preprocess = clip.load("ViT-B/32", device=self.torch_device)
+        assert isinstance(self.preprocess, object)
+
+    def _get_encoding(self, preprocessed_data, transform_type='image'):
+        with torch.no_grad():
+            if transform_type == 'image':
+                features = self.model.encode_image(preprocessed_data)
+            else:
+                features = self.model.encode_text(preprocessed_data)
+        features /= features.norm(dim=-1, keepdim=True)
+        return features
+
+    def _get_vecs_from_text(self, text_input):
+        texts_preprocessed = torch.cat([clip.tokenize(c) for c in text_input]).to(self.torch_device)
+        text_features = self._get_encoding(texts_preprocessed, transform_type='text')
+        return text_features
+
+    def _get_vecs_from_image(self, image_path):
+        image_preprocessed = self.preprocess(Image.open(image_path).convert("RGB")).unsqueeze(0).to(self.torch_device)
+        image_features = self._get_encoding(image_preprocessed, transform_type='image')
+        return image_features
+
+    def fit_transform(self, inputs=[], transform_type='image'):
+
+        results = []
+
+        for input in tqdm(inputs):
+            if transform_type == 'image':
+                embedding = self._get_vecs_from_image(input)
+                prefix = 'clip_image_'
+            else:
+                embedding = self._get_vecs_from_text(input)
+                prefix = 'clip_text_'
+            results.append((input, np.array(embedding)[0]))
+        results = pd.DataFrame(results, columns=['input', 'vector'])
+        vector_results = results['vector'].apply(pd.Series)
+        self.results = pd.concat([results['input'], vector_results], axis=1).set_index('input')
+
+        self.results.columns = [prefix + str(i) for i in self.results.columns]
+
+        return self.results
+
+
+class NetworkTransformer:
 
     def __init__(self, df):
         self.df = df
         self.edge_df = None
         self.node_df = None
-        self.node_dic = None
+        self.node_id_dic = None
         self.edge_df = None
         self.G = None
         self.graph_adjacencies = None
@@ -214,10 +322,16 @@ class NetworkGeneration:
         node_df['id_code'] = node_df.index
         return node_df
 
-    def _get_node_dic(self, node_df):
+    def _get_node_id_dic(self, node_df):
         dic_values = [i for i in range(len(node_df['id']))]
         # print(node_df['id'])
         return dict(zip(node_df['id'], dic_values))
+
+    def _get_node_dic(self, node_id_dic):
+        return dict((v, k) for k, v in node_id_dic.items())
+
+    def _get_adjacency_dic(self, id, adjacency_frequency):
+        return dict(zip(self.node_df[id], self.node_df[adjacency_frequency]))
 
     def _updated_edge_df(self, edge_df, node_dict):
         edge_df['source_code'] = edge_df['source'].apply(lambda x: node_dict[x])
@@ -243,23 +357,39 @@ class NetworkGeneration:
             if source_val in v:
                 return k
 
+    def _get_no_edge_df(self):
+
+        no_edge_df = pd.DataFrame(list(nx.non_edges(self.G)))
+        no_edge_df.columns = ['source', 'target']
+        no_edge_df['source'] = no_edge_df['source'].apply(lambda x: self.node_dic[x])
+        no_edge_df['target'] = no_edge_df['target'].apply(lambda x: self.node_dic[x])
+        no_edge_df['source_adjacency'] = no_edge_df['source'].apply(lambda x: self.adjacency_dic[x])
+        no_edge_df['target_adjacency'] = no_edge_df['target'].apply(lambda x: self.adjacency_dic[x])
+        return no_edge_df
+
     def fit_transform(self):
         print('Getting edges and nodes..')
         self.edge_df = self._get_edge_df(self.df)
         self.node_df = self._get_node_df(self.edge_df)
-        self.node_dic = self._get_node_dic(self.node_df)
-        self.edge_df = self._updated_edge_df(self.edge_df, self.node_dic)
-        print('Building graph..')
+        self.node_id_dic = self._get_node_id_dic(self.node_df)
+        self.node_dic = self._get_node_dic(self.node_id_dic)
+        self.edge_df = self._updated_edge_df(self.edge_df, self.node_id_dic)
 
+        print('Building graph..')
         self.G = self._build_graph(self.edge_df, self.node_df)
+
+        print('Getting graph features..')
         self.graph_adjacencies = dict(self.G.adjacency())
         self.graph_betweeness = nx.betweenness_centrality(self.G)
         self.graph_clustering_coeff = nx.clustering(self.G)
         self.graph_communities = nx.community.greedy_modularity_communities(self.G)
 
+        print('Updating DataFrames..')
         self.node_df['adjacency_frequency'] = self.node_df['id_code'].map(lambda x: len(self.graph_adjacencies[x]))
         self.node_df['betweeness_centrality'] = self.node_df['id_code'].map(lambda x: self.graph_betweeness[x])
         self.node_df['clustering_coefficient'] = self.node_df['id_code'].map(lambda x: self.graph_clustering_coeff[x])
+        self.adjacency_dic = self._get_adjacency_dic('id', 'adjacency_frequency')
+        self.no_edge_df = self._get_no_edge_df()
         self.graph_communities_dict = {}
         nodes_in_community = [list(i) for i in self.graph_communities]
 
@@ -268,6 +398,22 @@ class NetworkGeneration:
         self.node_df['community'] = self.node_df['id_code'].map(lambda x: self._community_allocation(x))
 
 
+if __name__ == '__main__':
+    # df = pd.DataFrame({'A':[['dog','cat','pig'],['penguin','cat','pig'],['dog','bird','pig']]})
+    # print(df)
+    #
+    # net = NetworkGeneration(df['A'])
+    # net.fit_transform()
+    # model = BertTransformer()
+    # results = model.fit_transform(['This is some text'])
 
+    model_clip = ClipTransformer()
+    result_image = model_clip.fit_transform(['this is some text'], transform_type='text')
 
-
+    model_bert = BertTransformer()
+    result_bert = model_bert.fit_transform(['this is some text'])
+    #
+    model_use = UniversalSentenceTransformer()
+    result_use = model_use.fit_transform(['this is some text','this is some more'])
+    # USE = hub.load("https://tfhub.dev/google/universal-sentence-encoder/4")
+    print('stop')
