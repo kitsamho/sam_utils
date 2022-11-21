@@ -2,7 +2,51 @@ import torch
 import clip
 import numpy as np
 
+class ClipTransformer:
 
+    def __init__(self):
+        self.torch_device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model, self.preprocess = clip.load("ViT-B/32", device=self.torch_device)
+        assert isinstance(self.preprocess, object)
+
+    def _get_encoding(self, preprocessed_data, transform_type='image'):
+        with torch.no_grad():
+            if transform_type == 'image':
+                features = self.model.encode_image(preprocessed_data)
+            else:
+                features = self.model.encode_text(preprocessed_data)
+        features /= features.norm(dim=-1, keepdim=True)
+        return features
+
+    def _get_vecs_from_text(self, text_input):
+        texts_preprocessed = torch.cat([clip.tokenize(c) for c in text_input]).to(self.torch_device)
+        text_features = self._get_encoding(texts_preprocessed, transform_type='text')
+        return text_features
+
+    def _get_vecs_from_image(self, image_path):
+        image_preprocessed = self.preprocess(Image.open(image_path).convert("RGB")).unsqueeze(0).to(self.torch_device)
+        image_features = self._get_encoding(image_preprocessed, transform_type='image')
+        return image_features
+
+    def fit_transform(self, inputs=[], transform_type='image'):
+
+        results = []
+
+        for input in tqdm(inputs):
+            if transform_type == 'image':
+                embedding = self._get_vecs_from_image(input)
+                prefix = 'clip_image_'
+            else:
+                embedding = self._get_vecs_from_text(input)
+                prefix = 'clip_text_'
+            results.append((input, np.array(embedding)[0]))
+        results = pd.DataFrame(results, columns=['input', 'vector'])
+        vector_results = results['vector'].apply(pd.Series)
+        self.results = pd.concat([results['input'], vector_results], axis=1).set_index('input')
+
+        self.results.columns = [prefix + str(i) for i in self.results.columns]
+
+        return self.results
 
 class CLIPZeroShotClassifier:
 
